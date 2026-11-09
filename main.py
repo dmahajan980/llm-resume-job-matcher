@@ -1,60 +1,49 @@
-import json
 import os
-from dotenv import load_dotenv
-from groq import Groq
+from concurrent.futures import as_completed, ProcessPoolExecutor
 from pathlib import Path
-from schemas import job_description
 from schemas.job_description import JobDescription
+from schemas.resume.comparison_result import ComparisonResult
+from utils.evaluate_resume import evaluate_resume
+from utils.parse_job_description import parse_job_description
+from utils.parse_resume import parse_resume
+from utils.extract_content import extract_content
 
 
-load_dotenv()
-LLM_API_KEY = os.getenv("GROQ_API_KEY")
-
-if not LLM_API_KEY:
-    raise ValueError("GROQ_API_KEY is not set")
-
-llm_client = Groq(api_key=LLM_API_KEY)
-model = "openai/gpt-oss-20b"
+MAX_PROCESSING_UNITS = min(os.cpu_count(), 2)
 
 
-########################################################
-# Structured job description extraction
-########################################################
-job_description_content = Path("samples/job_description.md").read_text()
-job_description_schema = JobDescription.model_json_schema()
+def read_and_evaluate_resume(
+    job_description: JobDescription, resume_file_path: Path
+) -> ComparisonResult:
+    try:
+        resume_content = extract_content(resume_file_path)
+        resume = parse_resume(resume_content)
+        return evaluate_resume(job_description, resume)
+    except Exception as error:
+        # Groq's APIStatusError cannot be pickled back to the parent process.
+        raise RuntimeError(str(error)) from None
 
-system_prompt = f"""
-You are an expert HR assistant.
 
-Your job is to analyze job descriptions and extract
-structured information from them.
+def main() -> None:
+    # Structured job description extraction
+    job_description_content = Path("samples/job_description.md").read_text()
+    job_description = parse_job_description(job_description_content)
 
-Return ONLY valid JSON matching this schema:
+    # Resume scoring
+    resume_directory = Path("samples/resumes")
+    resume_processing_futures = {}
 
-{job_description_schema}
+    with ProcessPoolExecutor(max_workers=MAX_PROCESSING_UNITS) as executor:
+        for resume_file_path in resume_directory.iterdir():
+            resume_processing_futures[
+                executor.submit(
+                    read_and_evaluate_resume, job_description, resume_file_path
+                )
+            ] = resume_file_path.name
 
-IMPORTANT:
-- Do not invent information. Fill the schema with actual information extracted from the job description.
-- If minimum experience is not mentioned, return null for the corresponding field.
-- If information for a list is missing, return an empty list for the corresponding field.
-"""
+    for future in as_completed(resume_processing_futures):
+        print(f"{resume_processing_futures[future]}: {future.result()}")
 
-user_prompt = f"""
-Analyze the following job description and extract structured information from it.
 
-{job_description_content}
-"""
-
-response = llm_client.chat.completions.create(
-    model=model,
-    messages=[
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ],
-    response_format={"type": "json_object"},
-)
-
-job_description_raw_json = response.choices[0].message.content
-job_description = JobDescription.model_validate_json(job_description_raw_json)
-
-print(job_description.model_dump_json(indent=2))
+if __name__ == "__main__":
+    main()
